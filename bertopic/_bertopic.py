@@ -25,6 +25,9 @@ from bertopic._mmr import mmr
 from bertopic.backend._utils import select_backend
 from bertopic import plotting
 
+# Added by SN Bhanja
+from ._utils import cleanse_text, remove_stopwords, replace_words
+
 # Visualization
 import plotly.graph_objects as go
 
@@ -76,6 +79,10 @@ class BERTopic:
                  umap_model: UMAP = None,
                  hdbscan_model: hdbscan.HDBSCAN = None,
                  vectorizer_model: CountVectorizer = None,
+                 similarity_threshold_merging: float = None,
+                 topic_words_diversity: float = None,
+                 stop_words: List[str] = None,
+                 replace_dic: dict() = None,
                  verbose: bool = False,
                  ):
         """BERTopic initialization
@@ -141,6 +148,14 @@ class BERTopic:
         # Vectorizer
         self.n_gram_range = n_gram_range
         self.vectorizer_model = vectorizer_model or CountVectorizer(ngram_range=self.n_gram_range)
+        
+        # Added by SN bhanja on February 18th, 2021
+        # Similarity threshold, intra-topic keywords diversity
+        # list of stop words and words replacement dictionary
+        self.similarity_threshold_merging = similarity_threshold_merging
+        self.topic_words_diversity = topic_words_diversity
+        self.stop_words = stop_words
+        self.replace_dic = replace_dic
 
         # UMAP
         self.umap_model = umap_model or UMAP(n_neighbors=15,
@@ -258,6 +273,9 @@ class BERTopic:
         check_documents_type(documents)
         check_embeddings_shape(embeddings, documents)
 
+        # Added by SN Bhanja
+        documents = [cleanse_text(doc) for doc in documents]
+
         documents = pd.DataFrame({"Document": documents,
                                   "ID": range(len(documents)),
                                   "Topic": None})
@@ -346,6 +364,9 @@ class BERTopic:
 
         if isinstance(documents, str):
             documents = [documents]
+        
+        # Added by Ariel Ibaba on April 7 2021
+        documents = [cleanse_text(doc) for doc in documents]
 
         if embeddings is None:
             embeddings = self._extract_embeddings(documents,
@@ -1356,6 +1377,22 @@ class BERTopic:
         Returns:
             c_tf_idf: The resulting matrix giving a value (importance score) for each word per topic
         """
+        # Added by SN Bhanja
+        documents_ = documents.copy()
+        documents_ = documents_.reset_index(drop=True)
+        doc_ids = np.asarray([idx for idx in np.arange(len(documents_)) if documents_.iloc[idx]['Topic'] == -1])
+        topics = [topic for topic in list(documents_.Topic) if topic != -1]
+        clusterer = self.hdbscan_model
+        tree = clusterer.condensed_tree_
+        clusters = tree._select_clusters()
+
+        for topic in topics:
+            cluster = clusters[topic]
+            c_exemplars = self.get_most_relevant_documents(cluster, tree)
+            doc_ids = np.hstack((doc_ids, c_exemplars))
+        documents_ = documents_.iloc[doc_ids, :]
+        documents_ = documents_.reset_index(drop=True)
+
         documents_per_topic = documents.groupby(['Topic'], as_index=False).agg({'Document': ' '.join})
         self.c_tf_idf, words = self._c_tf_idf(documents_per_topic, m=len(documents))
         self.topics = self._extract_words_per_topic(words)
@@ -1460,6 +1497,14 @@ class BERTopic:
         Returns:
             topics: The top words per topic
         """
+
+        # Added by SN Bhanja on April 7 2021
+        # Intra-topic keywords diversity rate
+        if self.topic_words_diversity is not None:
+            diversity = self.topic_words_diversity
+        else:
+            diversity = 0
+
         if c_tf_idf is None:
             c_tf_idf = self.c_tf_idf.toarray()
         else:
@@ -1488,7 +1533,7 @@ class BERTopic:
                                                            verbose=False).reshape(1, -1)
 
                 topic_words = mmr(topic_embedding, word_embeddings, words,
-                                  top_n=self.top_n_words, diversity=0)
+                                  top_n=self.top_n_words, diversity=diversity )
                 topics[topic] = [(word, value) for word, value in topics[topic] if word in topic_words]
 
         return topics
@@ -1675,7 +1720,7 @@ class BERTopic:
         else:
             return None
 
-    def _preprocess_text(self, documents: np.ndarray) -> List[str]:
+    def _preprocess_text(self, documents: np.ndarray) -> List[str]: 
         """ Basic preprocessing of text
 
         Steps:
@@ -1689,6 +1734,14 @@ class BERTopic:
         if self.language == "english":
             cleaned_documents = [re.sub(r'[^A-Za-z0-9 ]+', '', doc) for doc in cleaned_documents]
         cleaned_documents = [doc if doc != "" else "emptydoc" for doc in cleaned_documents]
+
+        # Added by Ariel Ibaba on April 7 2021
+        cleaned_documents = [cleanse_text(doc) for doc in cleaned_documents]
+        if self.stop_words is not None:
+            cleaned_documents = [remove_stopwords(doc, self.stop_words) for doc in cleaned_documents]
+        if self.replace_dic is not None:
+            cleaned_documents = [replace_words(doc, self.replace_dic) for doc in cleaned_documents]
+        
         return cleaned_documents
 
     @classmethod
@@ -1718,3 +1771,36 @@ class BERTopic:
             parameters += f"{parameter}={value}, "
 
         return f"BERTopic({parameters[:-2]})"
+
+
+    # Added by SN Bhanja
+    def get_most_relevant_documents(self,
+                          cluster_id: int,
+                          condensed_tree: hdbscan.plots.CondensedTree):
+        """ Get the most relevant documents associated with a given topic
+        Arguments:
+            cluster_id: The topic considered
+            condensed_tree: The condensed tree obtained with the HDBSCAN clusterer
+            
+        Usage:
+        Make sure to fit the model before and only input
+        a single topic for relevant documents extraction:
+        ```python
+        model.get_most_relevant_docs(cluster_id, condensed_tree)
+        """
+        
+        assert cluster_id > -1, "The topic's label should be greater than -1!"
+        
+        raw_tree = condensed_tree._raw_tree
+        # Just the cluster elements of the tree, excluding singleton points
+        cluster_tree = raw_tree[raw_tree['child_size'] > 1]
+        # Get the leaf cluster nodes under the cluster we are considering
+        leaves = hdbscan.plots._recurse_leaf_dfs(cluster_tree, cluster_id)
+        # Now collect up the last remaining points of each leaf cluster (the heart of the leaf)
+        result = np.array([])
+        for leaf in leaves:
+            max_lambda = raw_tree['lambda_val'][raw_tree['parent'] == leaf].max()
+            points = raw_tree['child'][(raw_tree['parent'] == leaf) &
+                                       (raw_tree['lambda_val'] == max_lambda)]
+            result = np.hstack((result, points))
+        return result.astype(np.int)
